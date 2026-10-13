@@ -17,6 +17,9 @@ package io.awspring.cloud.sns.core;
 
 import static io.awspring.cloud.sns.core.SnsHeaders.NOTIFICATION_SUBJECT_HEADER;
 
+import io.awspring.cloud.sns.core.observation.SnsPublishObserver;
+import io.awspring.cloud.sns.core.observation.SnsTemplateObservation;
+import io.micrometer.observation.ObservationRegistry;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -44,6 +47,7 @@ import software.amazon.awssdk.services.sns.model.NotFoundException;
  * @author Matej Nedic
  * @author Mariusz Sondecki
  * @author Hardik Singh Behl
+ * @author Sharang Gupta
  * @since 1.0
  */
 public class SnsTemplate extends AbstractMessageSendingTemplate<TopicMessageChannel>
@@ -52,6 +56,9 @@ public class SnsTemplate extends AbstractMessageSendingTemplate<TopicMessageChan
 	private final SnsClient snsClient;
 	private final TopicArnResolver topicArnResolver;
 	private final List<ChannelInterceptor> channelInterceptors = new ArrayList<>();
+	private ObservationRegistry observationRegistry = ObservationRegistry.NOOP;
+	private SnsTemplateObservation.@Nullable Convention observationConvention;
+	private volatile @Nullable SnsPublishObserver publishObserver;
 
 	public SnsTemplate(SnsClient snsClient) {
 		this(snsClient, null);
@@ -70,6 +77,41 @@ public class SnsTemplate extends AbstractMessageSendingTemplate<TopicMessageChan
 
 		if (messageConverter != null) {
 			this.setMessageConverter(initMessageConverter(messageConverter));
+		}
+	}
+
+	/**
+	 * Set the {@link ObservationRegistry} to record the observations of the published messages with. By default, the
+	 * messages are not observed. The trace context of the observations is sent as message attributes.
+	 *
+	 * @param observationRegistry the registry.
+	 * @since 4.3.0
+	 */
+	public void setObservationRegistry(ObservationRegistry observationRegistry) {
+		Assert.notNull(observationRegistry, "observationRegistry must not be null");
+		this.observationRegistry = observationRegistry;
+		updatePublishObserver();
+	}
+
+	/**
+	 * Set the {@link SnsTemplateObservation.Convention} to use instead of the default one for the observations of the
+	 * published messages.
+	 *
+	 * @param observationConvention the convention.
+	 * @since 4.3.0
+	 */
+	public void setObservationConvention(SnsTemplateObservation.Convention observationConvention) {
+		Assert.notNull(observationConvention, "observationConvention must not be null");
+		this.observationConvention = observationConvention;
+		updatePublishObserver();
+	}
+
+	private void updatePublishObserver() {
+		this.publishObserver = SnsPublishObserver.create(this.observationRegistry, this.observationConvention);
+		// the channel of the default destination is created when the default destination is set
+		TopicMessageChannel defaultDestination = getDefaultDestination();
+		if (defaultDestination != null) {
+			defaultDestination.setPublishObserver(this.publishObserver);
 		}
 	}
 
@@ -168,7 +210,8 @@ public class SnsTemplate extends AbstractMessageSendingTemplate<TopicMessageChan
 
 	private TopicMessageChannel resolveMessageChannelByTopicName(String topicName) {
 		Arn topicArn = this.topicArnResolver.resolveTopicArn(topicName);
-		TopicMessageChannel topicMessageChannel = new TopicMessageChannel(this.snsClient, topicArn);
+		TopicMessageChannel topicMessageChannel = new TopicMessageChannel(this.snsClient, topicArn,
+				this.publishObserver);
 		channelInterceptors.forEach(topicMessageChannel::addInterceptor);
 		return topicMessageChannel;
 	}

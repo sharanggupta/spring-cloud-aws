@@ -22,6 +22,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * Properties related to AWS SNS.
  *
  * @author Matej Nedic
+ * @author Sharang Gupta
  * @since 3.0
  */
 @ConfigurationProperties(prefix = SnsProperties.PREFIX)
@@ -37,11 +38,24 @@ public class SnsProperties extends AwsClientProperties {
 	 */
 	private boolean verification = true;
 
+	/**
+	 * Enables Micrometer observation of the messages published with the SNS templates. Disabled by default.
+	 */
+	private boolean observationEnabled = false;
+
 	public boolean getVerification() {
 		return verification;
 	}
 
 	public void setVerification(boolean verification) {
 		this.verification = verification;
+	}
+
+	public boolean isObservationEnabled() {
+		return observationEnabled;
+	}
+
+	public void setObservationEnabled(boolean observationEnabled) {
+		this.observationEnabled = observationEnabled;
 	}
 }

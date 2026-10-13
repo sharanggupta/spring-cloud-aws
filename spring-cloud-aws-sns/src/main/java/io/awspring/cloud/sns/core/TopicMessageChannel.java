@@ -19,6 +19,7 @@ import static io.awspring.cloud.sns.core.SnsHeaders.MESSAGE_DEDUPLICATION_ID_HEA
 import static io.awspring.cloud.sns.core.SnsHeaders.MESSAGE_GROUP_ID_HEADER;
 import static io.awspring.cloud.sns.core.SnsHeaders.NOTIFICATION_SUBJECT_HEADER;
 
+import io.awspring.cloud.sns.core.observation.SnsPublishObserver;
 import java.util.Map;
 import java.util.Optional;
 import org.jspecify.annotations.Nullable;
@@ -28,6 +29,7 @@ import software.amazon.awssdk.arns.Arn;
 import software.amazon.awssdk.services.sns.SnsClient;
 import software.amazon.awssdk.services.sns.model.MessageAttributeValue;
 import software.amazon.awssdk.services.sns.model.PublishRequest;
+import software.amazon.awssdk.services.sns.model.PublishResponse;
 
 /**
  * Implementation of {@link AbstractMessageChannel} which is used for converting and sending messages via
@@ -36,6 +38,7 @@ import software.amazon.awssdk.services.sns.model.PublishRequest;
  * @author Agim Emruli
  * @author Alain Sahli
  * @author Gyozo Papp
+ * @author Sharang Gupta
  * @since 1.0
  */
 public class TopicMessageChannel extends AbstractMessageChannel {
@@ -44,9 +47,28 @@ public class TopicMessageChannel extends AbstractMessageChannel {
 
 	private final Arn topicArn;
 
+	private volatile @Nullable SnsPublishObserver publishObserver;
+
 	public TopicMessageChannel(SnsClient snsClient, Arn topicArn) {
+		this(snsClient, topicArn, null);
+	}
+
+	/**
+	 * Create a channel that observes the messages it publishes.
+	 *
+	 * @param snsClient the client to publish with.
+	 * @param topicArn the ARN of the topic to publish to.
+	 * @param publishObserver the observer of the published messages, or {@code null} to not observe them.
+	 * @since 4.3.0
+	 */
+	public TopicMessageChannel(SnsClient snsClient, Arn topicArn, @Nullable SnsPublishObserver publishObserver) {
 		this.snsClient = snsClient;
 		this.topicArn = topicArn;
+		this.publishObserver = publishObserver;
+	}
+
+	void setPublishObserver(@Nullable SnsPublishObserver publishObserver) {
+		this.publishObserver = publishObserver;
 	}
 
 	@Nullable
@@ -57,6 +79,28 @@ public class TopicMessageChannel extends AbstractMessageChannel {
 
 	@Override
 	protected boolean sendInternal(Message<?> message, long timeout) {
+		PublishRequest publishRequest = toPublishRequest(message);
+		SnsPublishObserver observer = this.publishObserver;
+		if (observer == null) {
+			this.snsClient.publish(publishRequest);
+			return true;
+		}
+		SnsPublishObserver.Publication publication = observer.start(message, this.topicArn.resourceAsString());
+		try {
+			PublishResponse response = this.snsClient.publish(publication.withTraceContext(publishRequest));
+			publication.published(response.messageId());
+		}
+		catch (RuntimeException ex) {
+			publication.failed(ex);
+			throw ex;
+		}
+		finally {
+			publication.stop();
+		}
+		return true;
+	}
+
+	private PublishRequest toPublishRequest(Message<?> message) {
 		PublishRequest.Builder publishRequestBuilder = PublishRequest.builder();
 		publishRequestBuilder.topicArn(this.topicArn.toString()).message(message.getPayload().toString())
 				.subject(findNotificationSubject(message));
@@ -69,9 +113,7 @@ public class TopicMessageChannel extends AbstractMessageChannel {
 				.ifPresent(publishRequestBuilder::messageGroupId);
 		Optional.ofNullable(message.getHeaders().get(MESSAGE_DEDUPLICATION_ID_HEADER, String.class))
 				.ifPresent(publishRequestBuilder::messageDeduplicationId);
-
-		this.snsClient.publish(publishRequestBuilder.build());
-		return true;
+		return publishRequestBuilder.build();
 	}
 
 }

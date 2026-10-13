@@ -21,9 +21,13 @@ import io.awspring.cloud.sns.core.CachingTopicArnResolver;
 import io.awspring.cloud.sns.core.SnsAsyncTopicArnResolver;
 import io.awspring.cloud.sns.core.SnsNotification;
 import io.awspring.cloud.sns.core.TopicArnResolver;
+import io.awspring.cloud.sns.core.observation.SnsPublishObserver;
+import io.awspring.cloud.sns.core.observation.SnsTemplateObservation;
+import io.micrometer.observation.ObservationRegistry;
 import java.util.Collections;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import org.jspecify.annotations.Nullable;
 import org.springframework.messaging.Message;
 import org.springframework.messaging.core.MessagePostProcessor;
@@ -38,6 +42,7 @@ import software.amazon.awssdk.services.sns.model.PublishRequest;
  * Asynchronous template for SNS operations.
  *
  * @author Matej Nedic
+ * @author Sharang Gupta
  * @since 4.1.0
  */
 public class SnsAsyncTemplate implements SnsAsyncOperations {
@@ -45,6 +50,9 @@ public class SnsAsyncTemplate implements SnsAsyncOperations {
 	private final SnsAsyncClient snsAsyncClient;
 	private final TopicArnResolver topicArnResolver;
 	private final SnsPublishMessageConverter snsPublishMessageConverter;
+	private ObservationRegistry observationRegistry = ObservationRegistry.NOOP;
+	private SnsTemplateObservation.@Nullable Convention observationConvention;
+	private volatile @Nullable SnsPublishObserver publishObserver;
 
 	public SnsAsyncTemplate(SnsAsyncClient snsAsyncClient) {
 		this(snsAsyncClient, null);
@@ -65,6 +73,32 @@ public class SnsAsyncTemplate implements SnsAsyncOperations {
 				: messageConverter;
 	}
 
+	/**
+	 * Set the {@link ObservationRegistry} to record the observations of the published messages with. By default, the
+	 * messages are not observed. The trace context of the observations is sent as message attributes.
+	 *
+	 * @param observationRegistry the registry.
+	 * @since 4.3.0
+	 */
+	public void setObservationRegistry(ObservationRegistry observationRegistry) {
+		Assert.notNull(observationRegistry, "observationRegistry must not be null");
+		this.observationRegistry = observationRegistry;
+		this.publishObserver = SnsPublishObserver.create(this.observationRegistry, this.observationConvention);
+	}
+
+	/**
+	 * Set the {@link SnsTemplateObservation.Convention} to use instead of the default one for the observations of the
+	 * published messages.
+	 *
+	 * @param observationConvention the convention.
+	 * @since 4.3.0
+	 */
+	public void setObservationConvention(SnsTemplateObservation.Convention observationConvention) {
+		Assert.notNull(observationConvention, "observationConvention must not be null");
+		this.observationConvention = observationConvention;
+		this.publishObserver = SnsPublishObserver.create(this.observationRegistry, this.observationConvention);
+	}
+
 	@Override
 	public <T> CompletableFuture<PublishMessageResult<T>> send(String destination, Message<T> message) {
 		Assert.notNull(destination, "destination cannot be null");
@@ -75,7 +109,7 @@ public class SnsAsyncTemplate implements SnsAsyncOperations {
 		PublishRequestMessagePair<T> pair = snsPublishMessageConverter.convert(message);
 		PublishRequest request = pair.publishRequest().toBuilder().topicArn(topicArn.toString()).build();
 
-		return publish(request, pair.originalMessage());
+		return publish(request, pair.originalMessage(), topicArn.resourceAsString());
 	}
 
 	@Override
@@ -154,8 +188,41 @@ public class SnsAsyncTemplate implements SnsAsyncOperations {
 				});
 	}
 
-	private <T> CompletableFuture<PublishMessageResult<T>> publish(PublishRequest request, Message<T> originalMessage) {
+	private <T> CompletableFuture<PublishMessageResult<T>> publish(PublishRequest request, Message<T> originalMessage,
+			String topicName) {
+		SnsPublishObserver observer = this.publishObserver;
+		if (observer == null) {
+			return doPublish(request, originalMessage);
+		}
+		SnsPublishObserver.Publication publication = observer.start(originalMessage, topicName);
+		CompletableFuture<PublishMessageResult<T>> result;
+		try {
+			result = doPublish(publication.withTraceContext(request), originalMessage);
+		}
+		catch (RuntimeException ex) {
+			publication.failed(ex);
+			publication.stop();
+			throw ex;
+		}
+		return result.whenComplete((publishResult, throwable) -> {
+			if (throwable != null) {
+				publication.failed(unwrap(throwable));
+			}
+			else {
+				publication.published(publishResult.messageId());
+			}
+			publication.stop();
+		});
+	}
+
+	private <T> CompletableFuture<PublishMessageResult<T>> doPublish(PublishRequest request,
+			Message<T> originalMessage) {
 		return snsAsyncClient.publish(request).thenApply(response -> new PublishMessageResult<>(originalMessage,
 				response.messageId(), response.sequenceNumber()));
+	}
+
+	private static Throwable unwrap(Throwable throwable) {
+		return throwable instanceof CompletionException && throwable.getCause() != null ? throwable.getCause()
+				: throwable;
 	}
 }

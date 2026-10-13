@@ -16,6 +16,8 @@
 package io.awspring.cloud.autoconfigure.sns;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.mock;
 
 import io.awspring.cloud.autoconfigure.ConfiguredAwsClient;
@@ -29,9 +31,13 @@ import io.awspring.cloud.sns.core.async.SnsAsyncTemplate;
 import io.awspring.cloud.sns.core.batch.SnsBatchTemplate;
 import io.awspring.cloud.sns.core.batch.converter.SnsMessageConverter;
 import io.awspring.cloud.sns.core.batch.executor.BatchExecutionStrategy;
+import io.awspring.cloud.sns.core.observation.SnsTemplateObservation;
 import io.awspring.cloud.sns.sms.SnsSmsOperations;
 import io.awspring.cloud.sns.sms.SnsSmsTemplate;
+import io.micrometer.observation.tck.TestObservationRegistry;
+import io.micrometer.observation.tck.TestObservationRegistryAssert;
 import java.net.URI;
+import java.util.concurrent.CompletableFuture;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.ApplicationRunner;
@@ -49,6 +55,8 @@ import software.amazon.awssdk.arns.Arn;
 import software.amazon.awssdk.messagemanager.sns.SnsMessageManager;
 import software.amazon.awssdk.services.sns.SnsAsyncClient;
 import software.amazon.awssdk.services.sns.SnsClient;
+import software.amazon.awssdk.services.sns.model.PublishRequest;
+import software.amazon.awssdk.services.sns.model.PublishResponse;
 
 /**
  * Tests for class {@link io.awspring.cloud.autoconfigure.sns.SnsAutoConfiguration}.
@@ -195,6 +203,62 @@ class SnsAutoConfigurationTest {
 	}
 
 	@Nested
+	class ObservationTests {
+
+		@Test
+		void publishedMessagesAreNotObservedByDefault() {
+			contextRunner.withUserConfiguration(ObservationConfiguration.class).run(context -> {
+				context.getBean(SnsTemplate.class).convertAndSend("orders", "order-created");
+				context.getBean(SnsAsyncTemplate.class).convertAndSend("orders", "order-created").join();
+
+				TestObservationRegistryAssert.then(context.getBean(TestObservationRegistry.class))
+						.doesNotHaveAnyObservation();
+			});
+		}
+
+		@Test
+		void snsTemplateObservesPublishedMessagesWhenObservationIsEnabled() {
+			contextRunner.withUserConfiguration(ObservationConfiguration.class)
+					.withPropertyValues("spring.cloud.aws.sns.observation-enabled=true").run(context -> {
+						context.getBean(SnsTemplate.class).convertAndSend("orders", "order-created");
+
+						TestObservationRegistryAssert.then(context.getBean(TestObservationRegistry.class))
+								.hasNumberOfObservationsEqualTo(1).hasSingleObservationThat()
+								.hasNameEqualTo("spring.aws.sns.template")
+								.hasLowCardinalityKeyValue("messaging.destination.name", "orders");
+					});
+		}
+
+		@Test
+		void snsAsyncTemplateObservesPublishedMessagesWhenObservationIsEnabled() {
+			contextRunner.withUserConfiguration(ObservationConfiguration.class)
+					.withPropertyValues("spring.cloud.aws.sns.observation-enabled=true").run(context -> {
+						context.getBean(SnsAsyncTemplate.class).convertAndSend("orders", "order-created").join();
+
+						TestObservationRegistryAssert.then(context.getBean(TestObservationRegistry.class))
+								.hasNumberOfObservationsEqualTo(1).hasSingleObservationThat()
+								.hasNameEqualTo("spring.aws.sns.template")
+								.hasLowCardinalityKeyValue("messaging.destination.name", "orders");
+					});
+		}
+
+		@Test
+		void customObservationConventionIsUsedWhenObservationIsEnabled() {
+			contextRunner
+					.withUserConfiguration(ObservationConfiguration.class,
+							CustomObservationConventionConfiguration.class)
+					.withPropertyValues("spring.cloud.aws.sns.observation-enabled=true").run(context -> {
+						context.getBean(SnsTemplate.class).convertAndSend("orders", "order-created");
+						context.getBean(SnsAsyncTemplate.class).convertAndSend("orders", "order-created").join();
+
+						TestObservationRegistryAssert.then(context.getBean(TestObservationRegistry.class))
+								.hasNumberOfObservationsEqualTo(2).hasObservationWithNameEqualTo("custom.sns.publish");
+					});
+		}
+
+	}
+
+	@Nested
 	class SnsAsyncTemplateTests {
 
 		@Test
@@ -293,6 +357,52 @@ class SnsAutoConfigurationTest {
 	}
 
 	static class CustomChannelInterceptor implements ChannelInterceptor {
+	}
+
+	@Configuration(proxyBeanMethods = false)
+	static class ObservationConfiguration {
+
+		@Bean
+		SnsClient snsClient() {
+			SnsClient snsClient = mock(SnsClient.class);
+			given(snsClient.publish(any(PublishRequest.class)))
+					.willReturn(PublishResponse.builder().messageId("published-message-id").build());
+			return snsClient;
+		}
+
+		@Bean
+		SnsAsyncClient snsAsyncClient() {
+			SnsAsyncClient snsAsyncClient = mock(SnsAsyncClient.class);
+			given(snsAsyncClient.publish(any(PublishRequest.class))).willReturn(CompletableFuture
+					.completedFuture(PublishResponse.builder().messageId("published-message-id").build()));
+			return snsAsyncClient;
+		}
+
+		@Bean
+		TopicArnResolver topicArnResolver() {
+			return topicName -> Arn.fromString("arn:aws:sns:eu-west-1:123456789012:" + topicName);
+		}
+
+		@Bean
+		TestObservationRegistry observationRegistry() {
+			return TestObservationRegistry.create();
+		}
+
+	}
+
+	@Configuration(proxyBeanMethods = false)
+	static class CustomObservationConventionConfiguration {
+
+		@Bean
+		SnsTemplateObservation.Convention customObservationConvention() {
+			return new SnsTemplateObservation.DefaultConvention() {
+				@Override
+				public String getName() {
+					return "custom.sns.publish";
+				}
+			};
+		}
+
 	}
 
 	@Configuration(proxyBeanMethods = false)

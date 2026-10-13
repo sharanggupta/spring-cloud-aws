@@ -43,10 +43,13 @@ import io.awspring.cloud.sns.core.batch.converter.DefaultSnsMessageConverter;
 import io.awspring.cloud.sns.core.batch.converter.SnsMessageConverter;
 import io.awspring.cloud.sns.core.batch.executor.BatchExecutionStrategy;
 import io.awspring.cloud.sns.core.batch.executor.SequentialBatchExecutionStrategy;
+import io.awspring.cloud.sns.core.observation.SnsTemplateObservation;
 import io.awspring.cloud.sns.sms.SnsSmsOperations;
 import io.awspring.cloud.sns.sms.SnsSmsTemplate;
+import io.micrometer.observation.ObservationRegistry;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Consumer;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.AutoConfigureAfter;
@@ -82,6 +85,7 @@ import tools.jackson.databind.json.JsonMapper;
  * @author Manuel Wessner
  * @author Matej Nedic
  * @author Mariusz Sondecki
+ * @author Sharang Gupta
  */
 @AutoConfiguration
 @ConditionalOnClass({ SnsClient.class, SnsTemplate.class })
@@ -127,9 +131,15 @@ public class SnsAutoConfiguration {
 		@ConditionalOnMissingBean(SnsAsyncOperations.class)
 		@ConditionalOnBean(SnsAsyncClient.class)
 		public SnsAsyncTemplate snsAsyncTemplate(SnsAsyncClient snsAsyncClient,
-				Optional<TopicArnResolver> topicArnResolver, SnsPublishMessageConverter snsPublishMessageConverter) {
-			return topicArnResolver.map(it -> new SnsAsyncTemplate(snsAsyncClient, it, snsPublishMessageConverter))
+				Optional<TopicArnResolver> topicArnResolver, SnsPublishMessageConverter snsPublishMessageConverter,
+				SnsProperties snsProperties, ObjectProvider<ObservationRegistry> observationRegistry,
+				ObjectProvider<SnsTemplateObservation.Convention> observationConvention) {
+			SnsAsyncTemplate snsAsyncTemplate = topicArnResolver
+					.map(it -> new SnsAsyncTemplate(snsAsyncClient, it, snsPublishMessageConverter))
 					.orElseGet(() -> new SnsAsyncTemplate(snsAsyncClient, snsPublishMessageConverter));
+			configureObservation(snsProperties, observationRegistry, observationConvention,
+					snsAsyncTemplate::setObservationRegistry, snsAsyncTemplate::setObservationConvention);
+			return snsAsyncTemplate;
 		}
 
 		@Bean
@@ -149,13 +159,17 @@ public class SnsAutoConfiguration {
 		@ConditionalOnMissingBean(SnsOperations.class)
 		@Bean
 		public SnsTemplate snsTemplate(SnsClient snsClient, Optional<JsonMapper> jsonMapper,
-				Optional<TopicArnResolver> topicArnResolver, ObjectProvider<ChannelInterceptor> interceptors) {
+				Optional<TopicArnResolver> topicArnResolver, ObjectProvider<ChannelInterceptor> interceptors,
+				SnsProperties snsProperties, ObjectProvider<ObservationRegistry> observationRegistry,
+				ObjectProvider<SnsTemplateObservation.Convention> observationConvention) {
 			JacksonJsonMessageConverter converter = new JacksonJsonMessageConverter(
 					jsonMapper.orElseGet(JsonMapper::new));
 			converter.setSerializedPayloadClass(String.class);
 			SnsTemplate snsTemplate = topicArnResolver.map(it -> new SnsTemplate(snsClient, it, converter))
 					.orElseGet(() -> new SnsTemplate(snsClient, converter));
 			interceptors.forEach(snsTemplate::addChannelInterceptor);
+			configureObservation(snsProperties, observationRegistry, observationConvention,
+					snsTemplate::setObservationRegistry, snsTemplate::setObservationConvention);
 
 			return snsTemplate;
 		}
@@ -168,13 +182,17 @@ public class SnsAutoConfiguration {
 		@ConditionalOnMissingBean(SnsOperations.class)
 		@Bean
 		public SnsTemplate snsTemplate(SnsClient snsClient, Optional<ObjectMapper> objectMapper,
-				Optional<TopicArnResolver> topicArnResolver, ObjectProvider<ChannelInterceptor> interceptors) {
+				Optional<TopicArnResolver> topicArnResolver, ObjectProvider<ChannelInterceptor> interceptors,
+				SnsProperties snsProperties, ObjectProvider<ObservationRegistry> observationRegistry,
+				ObjectProvider<SnsTemplateObservation.Convention> observationConvention) {
 			MappingJackson2MessageConverter converter = new MappingJackson2MessageConverter();
 			converter.setSerializedPayloadClass(String.class);
 			objectMapper.ifPresent(converter::setObjectMapper);
 			SnsTemplate snsTemplate = topicArnResolver.map(it -> new SnsTemplate(snsClient, it, converter))
 					.orElseGet(() -> new SnsTemplate(snsClient, converter));
 			interceptors.forEach(snsTemplate::addChannelInterceptor);
+			configureObservation(snsProperties, observationRegistry, observationConvention,
+					snsTemplate::setObservationRegistry, snsTemplate::setObservationConvention);
 
 			return snsTemplate;
 		}
@@ -258,6 +276,17 @@ public class SnsAutoConfiguration {
 							getWebFluxNotificationSubjectHandlerMethodArgumentResolver());
 				}
 			};
+		}
+	}
+
+	private static void configureObservation(SnsProperties snsProperties,
+			ObjectProvider<ObservationRegistry> observationRegistry,
+			ObjectProvider<SnsTemplateObservation.Convention> observationConvention,
+			Consumer<ObservationRegistry> registrySetter,
+			Consumer<SnsTemplateObservation.Convention> conventionSetter) {
+		if (snsProperties.isObservationEnabled()) {
+			observationRegistry.ifAvailable(registrySetter);
+			observationConvention.ifAvailable(conventionSetter);
 		}
 	}
 

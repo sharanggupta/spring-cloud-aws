@@ -257,6 +257,84 @@ public SnsPublishMessageConverter customConverter() {
 
 Auto-configuration will automatically pick it up and configure `SnsAsyncTemplate` accordingly.
 
+=== Observability support
+
+Spring Cloud AWS SNS supports observability through Micrometer's Observation API. Every message that is published with the `SnsTemplate` or the `SnsAsyncTemplate` can be recorded as an observation, and the trace context of the observation is sent with the message.
+
+NOTE: Observability support for SNS was added in version 4.3.0. The messages published with the `SnsBatchTemplate` and the SMS messages published with the `SnsSmsTemplate` are not observed.
+
+==== Enabling observability
+
+Observability can be enabled in a Spring Boot application by:
+
+1. Setting the `spring.cloud.aws.sns.observation-enabled` property to `true`
+2. Having an `ObservationRegistry` bean in your application context
+
+When the templates are created directly, observability can be enabled by setting an `ObservationRegistry` and, optionally, a custom `SnsTemplateObservation.Convention`:
+
+[source,java]
+----
+@Bean
+SnsTemplate snsTemplate(SnsClient snsClient, ObservationRegistry observationRegistry) {
+	SnsTemplate snsTemplate = new SnsTemplate(snsClient);
+	snsTemplate.setObservationRegistry(observationRegistry);
+	return snsTemplate;
+}
+
+@Bean
+SnsAsyncTemplate snsAsyncTemplate(SnsAsyncClient snsAsyncClient, ObservationRegistry observationRegistry) {
+	SnsAsyncTemplate snsAsyncTemplate = new SnsAsyncTemplate(snsAsyncClient);
+	snsAsyncTemplate.setObservationRegistry(observationRegistry);
+	return snsAsyncTemplate;
+}
+----
+
+==== Available observations
+
+The `spring.aws.sns.template` observation records a message that is published to a topic. The observation of the `SnsAsyncTemplate` stops when the returned `CompletableFuture` completes, and records the failure if it completes exceptionally. The observation is a child of the observation that is current on the thread that publishes the message.
+
+Low cardinality tags:
+
+- `messaging.system`: "sns"
+- `messaging.operation`: "publish"
+- `messaging.destination.name`: The topic name
+- `messaging.destination.kind`: "topic"
+
+High cardinality tags:
+
+- `messaging.message.id`: The message id that SNS assigned to the published message.
+
+For FIFO topics, the following additional high cardinality tags are included:
+
+- `messaging.message.message-group.id`: The message group id
+- `messaging.message.message-deduplication.id`: The message deduplication id
+
+==== Trace context propagation
+
+When a tracing handler, such as the one of Micrometer Tracing, is registered with the `ObservationRegistry`, the trace context is sent as message attributes of type `String`: `traceparent`, `tracestate` and `baggage` for the W3C propagation, or `b3` for the B3 propagation. A message attribute that the message already has is not replaced.
+
+NOTE: SNS accepts at most 10 message attributes per message, and the `id` and the `timestamp` headers of a message are sent as message attributes too. When a message already has 10 message attributes, the trace context is not added to it, and the message is published as usual.
+
+==== Customizing observations
+
+A custom `SnsTemplateObservation.Convention` can be set on the templates to add custom tags or to replace the default ones. When Spring Boot auto-configuration is used, a `SnsTemplateObservation.Convention` bean is picked up automatically.
+
+To add custom tags while preserving the default ones, extend `SnsTemplateObservation.DefaultConvention` and override `getCustomLowCardinalityKeyValues` and/or `getCustomHighCardinalityKeyValues`:
+
+[source,java]
+----
+@Bean
+SnsTemplateObservation.Convention snsTemplateObservationConvention() {
+	return new SnsTemplateObservation.DefaultConvention() {
+		@Override
+		protected KeyValues getCustomHighCardinalityKeyValues(SnsTemplateObservation.Context context) {
+			Object paymentId = context.getMessage().getHeaders().get("payment-id");
+			return paymentId != null ? KeyValues.of("payment.id", paymentId.toString()) : KeyValues.empty();
+		}
+	};
+}
+----
+
 === Using the SNS client
 
 To have access to all lower-level SNS operations, it is recommended to use `SnsClient` from the AWS SDK. The `SnsClient` bean is autoconfigured by `SnsAutoConfiguration`.
@@ -353,6 +431,7 @@ The Spring Boot Starter for SNS provides the following configuration options:
 | `spring.cloud.aws.sns.enabled` | Enables the SNS integration. | No | `true`
 | `spring.cloud.aws.sns.endpoint` | Configures the endpoint used by `SnsClient`. | No | `http://localhost:4566`
 | `spring.cloud.aws.sns.region` | Configures the region used by `SnsClient`. | No | `eu-west-1`
+| `spring.cloud.aws.sns.observation-enabled` | Enables observability support for the messages published with `SnsTemplate` and `SnsAsyncTemplate`. | No | `false`
 |===
 
 === Client customization
